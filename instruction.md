@@ -48,7 +48,9 @@ The set of codes is not fixed; read it from the file.
 Amounts are exact decimal quantities in plain fixed-point notation: optional leading `-`, then
 digits, optionally followed by `.` and one or more digits. No thousands separators, no exponent
 notation. Negative amounts are normal — a refund offsetting a sale is negative. Amounts must not
-lose precision anywhere in the pipeline.
+lose precision anywhere in the pipeline: high-nominal currencies produce postings with up to
+eighteen significant digits, and a single minor unit at that magnitude still has to be reported
+exactly, both in a difference and in an echoed amount.
 
 You may assume `txn_id` is unique within each file, that no value appears both as a ledger
 `txn_id` and as a ledger `settlement_ref`, that the files contain no blank lines and no quoted

@@ -8,10 +8,12 @@ from __future__ import annotations
 import csv
 import json
 import subprocess
+
+import pytest
 from pathlib import Path
 
 PROJECT_DIR = Path("/app")
-CURRENCIES = {"USD": 2, "EUR": 2, "GBP": 2, "JPY": 0, "BHD": 3}
+CURRENCIES = {"USD": 2, "EUR": 2, "GBP": 2, "JPY": 0, "BHD": 3, "IDR": 2}
 TS = "2026-05-04T09:00:00Z"
 
 REPORT_HEADER = (
@@ -383,3 +385,182 @@ def test_unparseable_currencies_file_exits_two(tmp_path):
     result = run(input_dir, out)
     assert result.returncode == 2
     assert not (out / "reconciled.csv").exists()
+
+
+# --- exact decimal arithmetic ------------------------------------------------
+
+
+def test_high_magnitude_difference_is_exact(tmp_path):
+    """A one-minor-unit gap on a 16-digit amount is still one unit, not two."""
+    statement = [f"H1,{TS},IDR,92233720368547.75", f"H2,{TS},IDR,81234567890123.45"]
+    ledger = ["H1,,IDR,92233720368547.74", "H2,,IDR,81234567890123.44"]
+    out = tmp_path / "out"
+    run_ok(write_inputs(tmp_path / "in", statement, ledger, tolerance=1), out)
+    rows = report(out)
+
+    assert rows["H1"]["difference_minor"] == "1"
+    assert rows["H1"]["status"] == "MATCHED"
+    assert rows["H2"]["difference_minor"] == "1"
+    assert rows["H2"]["status"] == "MATCHED"
+
+
+def test_high_magnitude_amounts_are_echoed_exactly(tmp_path):
+    """A 16-digit amount survives into the report without losing its last minor unit."""
+    statement = [f"H1,{TS},IDR,99999999999999.99"]
+    ledger = ["H1,,IDR,99999999999999.99"]
+    out = tmp_path / "out"
+    run_ok(write_inputs(tmp_path / "in", statement, ledger, tolerance=0), out)
+    row = report(out)["H1"]
+
+    assert row["statement_amount"] == "99999999999999.99"
+    assert row["ledger_amount"] == "99999999999999.99"
+    assert row["difference_minor"] == "0"
+    assert row["status"] == "MATCHED"
+
+
+def test_group_netting_does_not_accumulate_error(tmp_path):
+    """A group that cancels a huge debit against a huge credit nets to the exact remainder."""
+    statement = [f"B1,{TS},IDR,0.03"]
+    ledger = [
+        "L1,B1,IDR,90000000000000.01",
+        "L2,B1,IDR,-90000000000000.00",
+        "L3,B1,IDR,0.02",
+    ]
+    out = tmp_path / "out"
+    run_ok(write_inputs(tmp_path / "in", statement, ledger, tolerance=0), out)
+    row = report(out)["B1"]
+
+    assert row["ledger_amount"] == "0.03"
+    assert row["difference_minor"] == "0"
+    assert row["status"] == "MATCHED"
+    assert row["ledger_entry_count"] == "3"
+
+
+def test_group_netting_of_many_large_members_is_exact(tmp_path):
+    """Summing five large members must not drift by a minor unit."""
+    statement = [f"B1,{TS},IDR,90000000000000.05"]
+    ledger = [f"L{i},B1,IDR,18000000000000.01" for i in range(1, 6)]
+    out = tmp_path / "out"
+    run_ok(write_inputs(tmp_path / "in", statement, ledger, tolerance=0), out)
+    row = report(out)["B1"]
+
+    assert row["ledger_amount"] == "90000000000000.05"
+    assert row["difference_minor"] == "0"
+    assert row["status"] == "MATCHED"
+
+
+# --- amount format strictness ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "amount",
+    ["1e3", "+10.00", ".5", "10.", " 10.00", "10.00 ", "--5.00", "", "0x10"],
+)
+def test_amount_outside_the_documented_format_is_quarantined(tmp_path, amount):
+    """Amounts not in plain fixed-point notation are quarantined, not coerced."""
+    statement = [f"A1,{TS},USD,{amount}", f"A2,{TS},USD,10.00"]
+    ledger = ["A1,,USD,10.00", "A2,,USD,10.00"]
+    out = tmp_path / "out"
+    run_ok(write_inputs(tmp_path / "in", statement, ledger, tolerance=0), out)
+
+    _, bad = quarantine(out)
+    assert bad == [["statement.csv", "2", "INVALID_AMOUNT"]]
+    assert report(out)["A1"]["status"] == "LEDGER_ONLY"
+
+
+# --- one-sided rows carry the right currency ---------------------------------
+
+
+def test_ledger_only_rows_carry_the_ledger_currency(tmp_path):
+    """A direct entry and a group with no statement row both report their own currency."""
+    statement = [f"S1,{TS},USD,5.00"]
+    ledger = ["S1,,USD,5.00", "D1,,JPY,700", "L1,B9,BHD,1.500", "L2,B9,BHD,0.500"]
+    out = tmp_path / "out"
+    run_ok(write_inputs(tmp_path / "in", statement, ledger, tolerance=0), out)
+    rows = report(out)
+
+    assert rows["D1"]["status"] == "LEDGER_ONLY"
+    assert rows["D1"]["currency"] == "JPY"
+    assert rows["D1"]["ledger_amount"] == "700"
+    assert rows["B9"]["status"] == "LEDGER_ONLY"
+    assert rows["B9"]["currency"] == "BHD"
+    assert rows["B9"]["ledger_amount"] == "2.000"
+
+
+def test_statement_only_row_carries_the_statement_currency(tmp_path):
+    """A statement row with no ledger side reports its own currency and a zero count."""
+    out = tmp_path / "out"
+    run_ok(write_inputs(tmp_path / "in", [f"S1,{TS},JPY,700"], [], tolerance=0), out)
+    row = report(out)["S1"]
+
+    assert row["status"] == "STATEMENT_ONLY"
+    assert row["currency"] == "JPY"
+    assert row["statement_amount"] == "700"
+    assert row["ledger_entry_count"] == "0"
+
+
+def test_mixed_currency_group_without_statement_row_has_empty_currency(tmp_path):
+    """An orphaned mixed-currency group reports an empty currency and no netted total."""
+    ledger = ["L1,B9,USD,10.00", "L2,B9,EUR,10.00"]
+    out = tmp_path / "out"
+    run_ok(write_inputs(tmp_path / "in", [], ledger, tolerance=0), out)
+    row = report(out)["B9"]
+
+    assert row["status"] == "MIXED_CURRENCY_GROUP"
+    assert row["currency"] == ""
+    assert row["ledger_amount"] == ""
+    assert row["statement_amount"] == ""
+    assert row["ledger_entry_count"] == "2"
+
+
+# --- every exit-2 trigger ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "missing", ["statement.csv", "ledger.csv", "config.toml", "currencies.json"]
+)
+def test_each_missing_input_file_exits_two(tmp_path, missing):
+    """Any absent required input is a hard stop with no output written."""
+    input_dir = write_inputs(tmp_path / "in", [f"T1,{TS},USD,1.00"], ["T1,,USD,1.00"], tolerance=0)
+    (input_dir / missing).unlink()
+    out = tmp_path / "out"
+
+    result = run(input_dir, out)
+    assert result.returncode == 2
+    assert not (out / "reconciled.csv").exists()
+    assert not (out / "quarantine.csv").exists()
+
+
+def test_unparseable_config_exits_two(tmp_path):
+    """A corrupt config.toml is a hard stop."""
+    input_dir = write_inputs(tmp_path / "in", [f"T1,{TS},USD,1.00"], ["T1,,USD,1.00"], tolerance=0)
+    (input_dir / "config.toml").write_text("[reconciliation\ntolerance", encoding="utf-8")
+    out = tmp_path / "out"
+
+    result = run(input_dir, out)
+    assert result.returncode == 2
+    assert not (out / "reconciled.csv").exists()
+
+
+def test_absent_tolerance_key_exits_two(tmp_path):
+    """config.toml without tolerance_minor_units is a hard stop."""
+    input_dir = write_inputs(tmp_path / "in", [f"T1,{TS},USD,1.00"], ["T1,,USD,1.00"], tolerance=0)
+    (input_dir / "config.toml").write_text("[reconciliation]\n", encoding="utf-8")
+    out = tmp_path / "out"
+
+    result = run(input_dir, out)
+    assert result.returncode == 2
+    assert not (out / "reconciled.csv").exists()
+
+
+@pytest.mark.parametrize("value", ['"1"', "1.5", "true"])
+def test_non_integer_tolerance_exits_two(tmp_path, value):
+    """A tolerance that is not an integer is a hard stop rather than a coerced value."""
+    input_dir = write_inputs(tmp_path / "in", [f"T1,{TS},USD,1.00"], ["T1,,USD,1.00"], tolerance=0)
+    (input_dir / "config.toml").write_text(
+        f"[reconciliation]\ntolerance_minor_units = {value}\n", encoding="utf-8"
+    )
+    out = tmp_path / "out"
+
+    result = run(input_dir, out)
+    assert result.returncode == 2
